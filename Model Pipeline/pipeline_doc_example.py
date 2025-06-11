@@ -1,8 +1,9 @@
+import os
 import torch
 import torch.nn as nn
 from torchvision import models
 from pipelineClass import MultimodalPipeline # Assuming the class is in this file
-
+from dotenv import load_dotenv
 
 class MultimodalHousingClassifier(nn.Module):
     def __init__(self, tabular_input_dim, num_classes, cnn_output_dim=512, tabular_emb_dim=128, pretrained=True):
@@ -46,10 +47,21 @@ class MultimodalHousingClassifier(nn.Module):
         return output
 
 if __name__ == '__main__':
+
+    load_dotenv()
+    BASE_DIR = os.getenv('FILE_PATH')
+    BASE_DIR = os.path.join('..',BASE_DIR)
+    if not BASE_DIR:
+        raise ValueError("FILE_PATH environment variable not set. Please create a .env file and set it.")
+
+    DATA_PATH = os.path.join(BASE_DIR, 'Full_preprocessed_detailed_house.csv')
+    print(f"Base Directory: {BASE_DIR}")
+    print(f"Data CSV Path: {DATA_PATH}")
+
     pipeline = MultimodalPipeline(
         model_class=MultimodalHousingClassifier,
-        csv_path='../Data/Full_preprocessed_detailed_house.csv',
-        image_base_dir='../Data/',
+        csv_path=DATA_PATH,
+        image_base_dir=BASE_DIR,
         image_col='frontview_url',
         target_col='woningtype',
         numeric_cols=['opp_pand', 'oppervlakte', 'build_year'],
