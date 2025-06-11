@@ -50,7 +50,6 @@ if __name__ == '__main__':
 
     load_dotenv()
     BASE_DIR = os.getenv('FILE_PATH')
-    BASE_DIR = os.path.join('..',BASE_DIR)
     if not BASE_DIR:
         raise ValueError("FILE_PATH environment variable not set. Please create a .env file and set it.")
 

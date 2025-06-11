@@ -8,7 +8,8 @@ import seaborn as sns
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
-from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import (f1_score, accuracy_score, recall_score, precision_score, 
+                             cohen_kappa_score, log_loss, classification_report, confusion_matrix)
 
 import torch
 import torch.nn as nn
@@ -276,7 +277,7 @@ class MultimodalPipeline:
 
 
     def evaluate(self):
-        """Evaluates the best model on the test set and prints a report."""
+        """Evaluates the best model on the test set and prints a comprehensive report."""
         if not self.best_model_path:
             print("\n⚠️ No best model found from training. Evaluating the last state.")
             self.best_model_path = self._save_model()
@@ -285,19 +286,45 @@ class MultimodalPipeline:
         final_model = self._load_model(self.best_model_path)
         
         final_model.eval()
-        all_preds, all_labels = [], []
+        all_preds, all_labels, all_probs = [], [], []
 
         with torch.no_grad():
             for images, tabular_data, labels in self.test_loader:
                 images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
+                
                 outputs = final_model(images, tabular_data)
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+                
+                # Get probabilities for log_loss
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                all_probs.extend(probs)
 
+                # Get predictions for other metrics
+                preds = np.argmax(probs, axis=1)
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy())
+        
+        # --- Calculate and Print Metrics ---
+        print("\n--- Evaluation Metrics ---")
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        kappa = cohen_kappa_score(all_labels, all_preds)
+        logloss = log_loss(all_labels, all_probs)
+
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision (macro): {precision:.4f}")
+        print(f"Recall (macro): {recall:.4f}")
+        print(f"F1 Score (macro): {f1:.4f}")
+        print(f"Cohen's Kappa: {kappa:.4f}")
+        print(f"Log Loss: {logloss:.4f}")
+
+
+        # --- Classification Report ---
         print("\n--- Classification Report ---")
         print(classification_report(all_labels, all_preds, target_names=self.class_names, zero_division=0))
 
+        # --- Confusion Matrix ---
         cm = confusion_matrix(all_labels, all_preds)
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap='Blues', xticklabels=self.class_names, yticklabels=self.class_names)
