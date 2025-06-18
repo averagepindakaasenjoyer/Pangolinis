@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from shapely.wkt import loads
 
 class MultimodalPipeline:
     """
@@ -146,7 +147,9 @@ class MultimodalPipeline:
         df = pd.read_csv(self.csv_path)
         if self.useMask:
             try:
-                df["mask"] = df["geometry"].apply(lambda g: self._rasterize_polygon(g))
+                df['geometry_obj'] = df['geometry'].apply(loads)
+                df["mask"] = df["geometry_obj"].apply(lambda g: self._rasterize_polygon(g))
+                df.drop(columns=['geometry_obj'], inplace=True)
             except Exception: # Catch a more general exception for robustness
                 self.useMask = False
                 print('Could not apply rasterisation. Setting useMask to False.')
