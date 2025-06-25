@@ -1,20 +1,23 @@
 import os
 import pandas as pd
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
+from datetime import datetime # Import datetime for timestamping
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
-from sklearn.metrics import (f1_score, accuracy_score, recall_score, precision_score, 
-                             cohen_kappa_score, log_loss, classification_report, confusion_matrix)
+from sklearn.metrics import (f1_score, accuracy_score, recall_score, precision_score,
+    cohen_kappa_score, log_loss, classification_report, confusion_matrix)
 
+from shapely.affinity import translate, scale
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from shapely.wkt import loads
 
 class MultimodalPipeline:
     """
@@ -37,7 +40,8 @@ class MultimodalPipeline:
                  lr: float = 1e-4,
                  image_size: tuple = (224, 224),
                  save_filename: str = 'best_model.pth',
-                 device: str = None):
+                 device: str = None,
+                 useMask: bool = False):
         """
         Initializes the pipeline.
 
@@ -73,11 +77,12 @@ class MultimodalPipeline:
         self.target_col = target_col
         self.numeric_cols = numeric_cols
         self.categorical_cols = categorical_cols
+        self.useMask = useMask
 
         # Image transformations
         self.image_size = image_size
         self.train_transforms, self.val_transforms = self._get_transforms()
-        
+
         # Will be populated by _prepare_data
         self.label_encoder = LabelEncoder()
         self.scaler = StandardScaler()
@@ -92,7 +97,9 @@ class MultimodalPipeline:
         self._prepare_data()
 
         # Initialize model, criterion, and optimizer
-        self.model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes).to(self.device)
+        self.model = self.model_class(tabular_input_dim=self.tabular_input_dim,
+            num_classes=self.num_classes,
+            useMask=self.useMask).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.best_val_f1 = 0
@@ -119,22 +126,45 @@ class MultimodalPipeline:
         ])
         return train_transforms, val_transforms
 
+    def _rasterize_polygon(self, geom):
+        size = self.image_size[0]
+        bounds = geom.bounds
+        geom = translate(geom, xoff=-bounds[0], yoff=-bounds[1])
+        scale_x = size / (bounds[2] - bounds[0] + 1e-8)
+        scale_y = size / (bounds[3] - bounds[1] + 1e-8)
+        geom = scale(geom, xfact=scale_x, yfact=scale_y, origin=(0, 0))
+
+        img = Image.new("L", self.image_size, 0)
+        draw = ImageDraw.Draw(img)
+        coords = [(x, size - y) for x, y in geom.exterior.coords]
+        draw.polygon(coords, outline=1, fill=1)
+        return np.array(img)
+
 
     def _prepare_data(self):
         """Loads and preprocesses the data from the CSV file."""
         print("--- Preparing Data ---")
         df = pd.read_csv(self.csv_path)
+        if self.useMask:
+            try:
+                df['geometry_obj'] = df['geometry'].apply(loads)
+                df["mask"] = df["geometry_obj"].apply(lambda g: self._rasterize_polygon(g))
+                df.drop(columns=['geometry_obj'], inplace=True)
+            except Exception: # Catch a more general exception for robustness
+                self.useMask = False
+                print('Could not apply rasterisation. Setting useMask to False.')
+
 
         # 1. Stratified split into train (60%), validation (20%), and test (20%)
         print("Splitting data...")
         train_df, temp_df = train_test_split(df, test_size=0.4, random_state=42, stratify=df[self.target_col])
         val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df[self.target_col])
-        
+
         # --- Preprocess Target Column ---
         train_df['label'] = self.label_encoder.fit_transform(train_df[self.target_col])
         val_df['label'] = self.label_encoder.transform(val_df[self.target_col])
         test_df['label'] = self.label_encoder.transform(test_df[self.target_col])
-        
+
         self.class_names = list(self.label_encoder.classes_)
         self.num_classes = len(self.class_names)
         print(f"Found {self.num_classes} classes.")
@@ -145,7 +175,7 @@ class MultimodalPipeline:
         train_df[self.numeric_cols] = self.scaler.fit_transform(train_df[self.numeric_cols])
         val_df[self.numeric_cols] = self.scaler.transform(val_df[self.numeric_cols])
         test_df[self.numeric_cols] = self.scaler.transform(test_df[self.numeric_cols])
-        
+
         # Categorical features
         self.one_hot_encoder.fit(train_df[self.categorical_cols])
         cat_encoded_cols = list(self.one_hot_encoder.get_feature_names_out(self.categorical_cols))
@@ -162,16 +192,16 @@ class MultimodalPipeline:
         self.tabular_features = self.numeric_cols + cat_encoded_cols
         self.tabular_input_dim = len(self.tabular_features)
         print(f"Total tabular features: {self.tabular_input_dim}")
-        
+
         # --- Create Image Paths ---
         for d in [train_df, val_df, test_df]:
             d['img_path'] = d[self.image_col].apply(lambda x: os.path.join(self.image_base_dir, x))
 
         # --- Create Datasets and DataLoaders ---
         print("Creating Datasets and DataLoaders...")
-        train_dataset = HousingDataset(train_df, self.tabular_features, self.train_transforms)
-        val_dataset = HousingDataset(val_df, self.tabular_features, self.val_transforms)
-        test_dataset = HousingDataset(test_df, self.tabular_features, self.val_transforms)
+        train_dataset = HousingDataset(train_df, self.tabular_features, self.useMask, self.train_transforms)
+        val_dataset = HousingDataset(val_df, self.tabular_features, self.useMask, self.val_transforms) # Use val_transforms here
+        test_dataset = HousingDataset(test_df, self.tabular_features, self.useMask, self.val_transforms) # Use val_transforms here
 
         num_workers = 0 if os.name == 'nt' else 2
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
@@ -185,18 +215,28 @@ class MultimodalPipeline:
     def _run_epoch(self, dataloader, is_training=True):
         """Helper function to run a single epoch of training or validation."""
         self.model.train(is_training)
-        
+
         running_loss = 0.0
         all_preds, all_labels = [], []
 
         desc = "Training" if is_training else "Validating"
         loop = tqdm(dataloader, desc=desc, leave=False)
-        
-        for images, tabular_data, labels in loop:
-            images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
+
+        for batch_data in loop:
+            if self.useMask:
+                images, tabular_data, masks, labels = batch_data
+                images, tabular_data, masks, labels = images.to(self.device), tabular_data.to(self.device), masks.to(self.device), labels.to(self.device)
+            else:
+                images, tabular_data, labels = batch_data
+                images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
+
 
             with torch.set_grad_enabled(is_training):
-                outputs = self.model(images, tabular_data)
+                if self.useMask:
+                    outputs = self.model(images, tabular_data, masks)
+                else:
+                    outputs = self.model(images, tabular_data)
+
                 loss = self.criterion(outputs, labels)
 
                 if is_training:
@@ -214,36 +254,50 @@ class MultimodalPipeline:
         epoch_acc = accuracy_score(all_labels, all_preds)
         epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
         return epoch_loss, epoch_acc, epoch_f1
-    
+
 
     def _save_model(self):
-        """Saves the model's state dictionary, adding a suffix if the file exists."""
+        """
+        Saves the model's state dictionary. It will overwrite the existing 'best_model.pth'
+        from the current training run. If other models exist in the 'models' folder,
+        a new timestamped file will be created to avoid overwriting them.
+        """
         models_dir = 'models'
         os.makedirs(models_dir, exist_ok=True)
         base_path = os.path.join(models_dir, self.save_filename)
-        
+
+        # Check for other .pth files in the directory
+        existing_pth_files = [f for f in os.listdir(models_dir) if f.endswith('.pth') and f != self.save_filename]
+
         path_to_save = base_path
-        # If file exists, add a numeric suffix
-        if os.path.exists(base_path):
+        if existing_pth_files:
+            # If other .pth files exist, create a new timestamped file
+            timestamp = datetime.now().strftime("%m%d_%H%M")
             base_name, ext = os.path.splitext(self.save_filename)
-            suffix = 1
-            while True:
-                new_filename = f"{base_name}_{suffix}{ext}"
-                new_path = os.path.join(models_dir, new_filename)
-                if not os.path.exists(new_path):
-                    path_to_save = new_path
-                    break
-                suffix += 1
+            path_to_save = os.path.join(models_dir, f"{base_name}_{timestamp}{ext}")
+            print(f"Other models found in '{models_dir}'. Saving new model to '{path_to_save}' to avoid conflict.")
+        else:
+            # If no other .pth files, or only 'best_model.pth' from a previous run,
+            # overwrite the default 'best_model.pth'
+            print(f"Saving model to '{path_to_save}' (overwriting if it exists from this run).")
 
         torch.save(self.model.state_dict(), path_to_save)
         print(f"Model saved to {path_to_save}")
         return path_to_save
 
 
+    def load_saved_model(self, path):
+        """Loads a saved model state dictionary."""
+        # Re-initialize a fresh model architecture
+        loaded_model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes, useMask=self.useMask)
+        loaded_model.load_state_dict(torch.load(path, map_location=self.device))
+        loaded_model.to(self.device)
+        return loaded_model
+
     def _load_model(self, path):
         """Loads a saved model state dictionary."""
         # Re-initialize a fresh model architecture
-        loaded_model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes)
+        loaded_model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes, useMask=self.useMask)
         loaded_model.load_state_dict(torch.load(path, map_location=self.device))
         loaded_model.to(self.device)
         loaded_model.eval()
@@ -259,50 +313,56 @@ class MultimodalPipeline:
 
         for epoch in range(1, self.epochs + 1):
             print(f"\n--- Epoch {epoch}/{self.epochs} ---")
-            
+
             train_loss, train_acc, train_f1 = self._run_epoch(self.train_loader, is_training=True)
             val_loss, val_acc, val_f1 = self._run_epoch(self.val_loader, is_training=False)
 
-            print(f"  Train -> Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
-            print(f"  Valid -> Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+            print(f"   Train -> Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
+            print(f"   Valid -> Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
 
             # Save the best model based on validation F1 score
             if val_f1 > self.best_val_f1:
                 self.best_val_f1 = val_f1
                 self.best_model_path = self._save_model()
                 print(f"🎉 New best model saved with F1 score: {self.best_val_f1:.4f}")
-        
+
         print("\n✅ Training complete.")
         return self.best_model_path
-
 
     def evaluate(self):
         """Evaluates the best model on the test set and prints a comprehensive report."""
         if not self.best_model_path:
             print("\n⚠️ No best model found from training. Evaluating the last state.")
-            self.best_model_path = self._save_model()
+            # Ensure the model is saved if no best one was found during training
+            self.best_model_path = self._save_model() # This will save the last state if no better model was found
 
         print(f"\n📊 Loading best model from '{self.best_model_path}' and evaluating on the test set...")
         final_model = self._load_model(self.best_model_path)
-        
+
         final_model.eval()
-        all_preds, all_labels, all_probs = [], [], []
+        all_preds, all_labels, all_probs_list = [], [], [] # Renamed all_probs to all_probs_list
 
         with torch.no_grad():
-            for images, tabular_data, labels in self.test_loader:
-                images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
-                
-                outputs = final_model(images, tabular_data)
-                
-                # Get probabilities for log_loss
-                probs = torch.softmax(outputs, dim=1).cpu().numpy()
-                all_probs.extend(probs)
+            for batch_data in self.test_loader:
+                if self.useMask:
+                    images, tabular_data, masks, labels = batch_data
+                    images, tabular_data, masks, labels = images.to(self.device), tabular_data.to(self.device), masks.to(self.device), labels.to(self.device)
+                    outputs = final_model(images, tabular_data, masks)
+                else:
+                    images, tabular_data, labels = batch_data
+                    images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
+                    outputs = final_model(images, tabular_data)
 
-                # Get predictions for other metrics
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                all_probs_list.append(probs) # Append the numpy array for each batch
+
                 preds = np.argmax(probs, axis=1)
                 all_preds.extend(preds)
                 all_labels.extend(labels.cpu().numpy())
-        
+
+        # Concatenate all probability arrays into a single 2D array
+        all_probs_combined = np.vstack(all_probs_list)
+
         # --- Calculate and Print Metrics ---
         print("\n--- Evaluation Metrics ---")
         accuracy = accuracy_score(all_labels, all_preds)
@@ -310,7 +370,8 @@ class MultimodalPipeline:
         recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
         kappa = cohen_kappa_score(all_labels, all_preds)
-        logloss = log_loss(all_labels, all_probs)
+        # Pass the correctly shaped all_probs_combined to log_loss
+        logloss = log_loss(all_labels, all_probs_combined)
 
         print(f"Accuracy: {accuracy:.4f}")
         print(f"Precision (macro): {precision:.4f}")
@@ -337,14 +398,15 @@ class MultimodalPipeline:
 
 class HousingDataset(Dataset):
     """Custom PyTorch Dataset for loading images and tabular features."""
-    def __init__(self, df, tabular_features, transform=None):
+    def __init__(self, df, tabular_features, useMask, transform=None):
         self.df = df.reset_index(drop=True)
         self.transform = transform
+        self.useMask = useMask
         self.tabular_features = tabular_features
-        
+
     def __len__(self):
         return len(self.df)
-    
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         try:
@@ -352,16 +414,21 @@ class HousingDataset(Dataset):
             img = Image.open(row['img_path']).convert('RGB')
             if self.transform:
                 img = self.transform(img)
-            
+
             # Tabular features
             tab_feats_vals = row[self.tabular_features].values.astype(np.float32)
             tab_feats = torch.from_numpy(tab_feats_vals)
-            
+
             # Label
             label = torch.tensor(row['label'], dtype=torch.long)
-            
-            return img, tab_feats, label
-            
+
+            if self.useMask:
+                mask = torch.from_numpy(row['mask']).float().unsqueeze(0)
+                return img, tab_feats, mask, label
+            else:
+                return img, tab_feats, label
+
+
         except Exception as e:
             # On error, return the next valid sample to avoid crashing the loader
             # print(f"Error loading data at index {idx} (path: {row['img_path']}). Skipping. Error: {e}")
