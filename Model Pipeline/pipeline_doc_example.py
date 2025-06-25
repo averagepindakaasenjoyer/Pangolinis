@@ -130,7 +130,7 @@ class CNNWithTabular(nn.Module):
 
 
 class MultimodalHousingClassifierWithMask(nn.Module):
-    def __init__(self, tabular_input_dim, num_classes, cnn_output_dim=512, tabular_emb_dim=128, pretrained=True, useMask=False):
+    def __init__(self, tabular_input_dim, num_classes, cnn_output_dim=512, tabular_emb_dim=128, pretrained=True, useMask=True):
         super().__init__()
 
         self.useMask = useMask

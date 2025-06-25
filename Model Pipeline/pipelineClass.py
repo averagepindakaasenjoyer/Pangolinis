@@ -286,6 +286,14 @@ class MultimodalPipeline:
         return path_to_save
 
 
+    def load_saved_model(self, path):
+        """Loads a saved model state dictionary."""
+        # Re-initialize a fresh model architecture
+        loaded_model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes, useMask=self.useMask)
+        loaded_model.load_state_dict(torch.load(path, map_location=self.device))
+        loaded_model.to(self.device)
+        return loaded_model
+
     def _load_model(self, path):
         """Loads a saved model state dictionary."""
         # Re-initialize a fresh model architecture
