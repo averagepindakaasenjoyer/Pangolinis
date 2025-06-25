@@ -6,6 +6,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime # Import datetime for timestamping
+import pickle # For saving preprocessing objects
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
@@ -18,6 +19,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from shapely.wkt import loads
+from shapely.errors import WKTReadingError
 
 class MultimodalPipeline:
     """
@@ -59,6 +61,7 @@ class MultimodalPipeline:
             image_size (tuple): The size (height, width) to which images will be resized.
             save_filename (str): The filename for saving the best model.
             device (str, optional): The device to run on ('cuda' or 'cpu'). Defaults to auto-detection.
+            useMask (bool): Whether to include mask data in the dataset and model.
         """
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -83,7 +86,7 @@ class MultimodalPipeline:
         self.image_size = image_size
         self.train_transforms, self.val_transforms = self._get_transforms()
 
-        # Will be populated by _prepare_data
+        # Will be populated by _prepare_data or _load_preprocessors
         self.label_encoder = LabelEncoder()
         self.scaler = StandardScaler()
         self.one_hot_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
@@ -93,13 +96,20 @@ class MultimodalPipeline:
         self.class_names = []
         self.train_loader, self.val_loader, self.test_loader = None, None, None
 
+        # Preprocessor saving directory
+        self.preprocessor_dir = "preprocessors"
+        os.makedirs(self.preprocessor_dir, exist_ok=True)
+
         # Prepare all data and loaders
         self._prepare_data()
 
-        # Initialize model, criterion, and optimizer
-        self.model = self.model_class(tabular_input_dim=self.tabular_input_dim,
-            num_classes=self.num_classes,
-            useMask=self.useMask).to(self.device)
+        # Initialize model
+        # The model_class now only takes tabular_input_dim and num_classes
+        self.model = self.model_class(
+            tabular_input_dim=self.tabular_input_dim,
+            num_classes=self.num_classes
+        ).to(self.device)
+
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.best_val_f1 = 0
@@ -138,70 +148,136 @@ class MultimodalPipeline:
         draw = ImageDraw.Draw(img)
         coords = [(x, size - y) for x, y in geom.exterior.coords]
         draw.polygon(coords, outline=1, fill=1)
-        return np.array(img)
+        return np.array(img, dtype=np.float32)
 
 
     def _prepare_data(self):
         """Loads and preprocesses the data from the CSV file."""
         print("--- Preparing Data ---")
         df = pd.read_csv(self.csv_path)
+
+        # Ensure 'geometry_wkt' is loaded and converted to shapely objects if useMask is true
         if self.useMask:
+            if 'geometry_wkt' not in df.columns:
+                raise ValueError("The 'geometry_wkt' column is required for mask generation when useMask=True.")
             try:
-                df['geometry_obj'] = df['geometry'].apply(loads)
+                # Assuming geometry_wkt is already a WKT string, parse it
+                df['geometry_obj'] = df['geometry_wkt'].apply(loads)
                 df["mask"] = df["geometry_obj"].apply(lambda g: self._rasterize_polygon(g))
                 df.drop(columns=['geometry_obj'], inplace=True)
-            except Exception: # Catch a more general exception for robustness
+            except Exception as e:
+                print(f'Error during mask rasterization: {e}. Disabling mask usage for pipeline.')
                 self.useMask = False
-                print('Could not apply rasterisation. Setting useMask to False.')
+        else:
+             print("Mask usage is disabled for the pipeline.")
 
 
         # 1. Stratified split into train (60%), validation (20%), and test (20%)
         print("Splitting data...")
+        # Ensure target column exists before stratifying
+        if self.target_col not in df.columns:
+             raise ValueError(f"Target column '{self.target_col}' not found in the DataFrame.")
+
+        # Filter out rows where target_col might be NaN if it's an issue
+        df = df.dropna(subset=[self.target_col]).reset_index(drop=True)
+
+
         train_df, temp_df = train_test_split(df, test_size=0.4, random_state=42, stratify=df[self.target_col])
         val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df[self.target_col])
 
         # --- Preprocess Target Column ---
-        train_df['label'] = self.label_encoder.fit_transform(train_df[self.target_col])
+        self.label_encoder.fit(train_df[self.target_col])
+        train_df['label'] = self.label_encoder.transform(train_df[self.target_col])
         val_df['label'] = self.label_encoder.transform(val_df[self.target_col])
         test_df['label'] = self.label_encoder.transform(test_df[self.target_col])
 
         self.class_names = list(self.label_encoder.classes_)
         self.num_classes = len(self.class_names)
-        print(f"Found {self.num_classes} classes.")
+        print(f"Found {self.num_classes} classes: {self.class_names}")
 
         # --- Preprocess Tabular Features ---
         print("Preprocessing tabular features...")
         # Numeric features
-        train_df[self.numeric_cols] = self.scaler.fit_transform(train_df[self.numeric_cols])
-        val_df[self.numeric_cols] = self.scaler.transform(val_df[self.numeric_cols])
-        test_df[self.numeric_cols] = self.scaler.transform(test_df[self.numeric_cols])
+        # Filter numeric_cols to only include those present in df
+        actual_numeric_cols = [col for col in self.numeric_cols if col in df.columns]
+        if not actual_numeric_cols:
+            print("Warning: No numeric columns found for scaling.")
+        else:
+            self.scaler.fit(train_df[actual_numeric_cols])
+            train_df[actual_numeric_cols] = self.scaler.transform(train_df[actual_numeric_cols])
+            val_df[actual_numeric_cols] = self.scaler.transform(val_df[actual_numeric_cols])
+            test_df[actual_numeric_cols] = self.scaler.transform(test_df[actual_numeric_cols])
 
         # Categorical features
-        self.one_hot_encoder.fit(train_df[self.categorical_cols])
-        cat_encoded_cols = list(self.one_hot_encoder.get_feature_names_out(self.categorical_cols))
+        actual_categorical_cols = [col for col in self.categorical_cols if col in df.columns]
+        if not actual_categorical_cols:
+            print("Warning: No categorical columns found for one-hot encoding.")
+            cat_encoded_cols = []
+        else:
+            # Handle unknown categories during transform by making sure they exist in training set
+            for col in actual_categorical_cols:
+                train_df[col] = train_df[col].astype('category')
+                # For val/test, add categories observed in training to prevent errors on unseen categories
+                val_df[col] = pd.Categorical(val_df[col], categories=train_df[col].cat.categories)
+                test_df[col] = pd.Categorical(test_df[col], categories=train_df[col].cat.categories)
 
-        def encode_and_merge(df):
-            encoded_data = self.one_hot_encoder.transform(df[self.categorical_cols])
-            encoded_df = pd.DataFrame(encoded_data, columns=cat_encoded_cols, index=df.index)
-            return pd.concat([df.drop(columns=self.categorical_cols), encoded_df], axis=1)
+            self.one_hot_encoder.fit(train_df[actual_categorical_cols])
+            cat_encoded_cols = list(self.one_hot_encoder.get_feature_names_out(actual_categorical_cols))
 
-        train_df = encode_and_merge(train_df)
-        val_df = encode_and_merge(val_df)
-        test_df = encode_and_merge(test_df)
+        def encode_and_merge(df_to_encode, encoder_obj, cols_to_encode, encoded_names):
+            if not cols_to_encode: # No categorical columns to encode
+                return df_to_encode.copy()
+            encoded_data = encoder_obj.transform(df_to_encode[cols_to_encode])
+            encoded_df = pd.DataFrame(encoded_data, columns=encoded_names, index=df_to_encode.index)
+            return pd.concat([df_to_encode.drop(columns=cols_to_encode, errors='ignore'), encoded_df], axis=1)
 
-        self.tabular_features = self.numeric_cols + cat_encoded_cols
+        train_df = encode_and_merge(train_df, self.one_hot_encoder, actual_categorical_cols, cat_encoded_cols)
+        val_df = encode_and_merge(val_df, self.one_hot_encoder, actual_categorical_cols, cat_encoded_cols)
+        test_df = encode_and_merge(test_df, self.one_hot_encoder, actual_categorical_cols, cat_encoded_cols)
+
+        # Define full list of tabular features AFTER encoding
+        self.tabular_features = actual_numeric_cols + cat_encoded_cols
         self.tabular_input_dim = len(self.tabular_features)
         print(f"Total tabular features: {self.tabular_input_dim}")
 
+        # Ensure all tabular features are numeric and handle NaNs
+        def clean_and_convert_features(df_to_clean, feature_list):
+            cleaned_df = df_to_clean.copy()
+            for feature in feature_list:
+                if feature in cleaned_df.columns:
+                    cleaned_df[feature] = pd.to_numeric(cleaned_df[feature], errors='coerce')
+                    cleaned_df[feature] = cleaned_df[feature].fillna(0) # Fill NaNs with 0
+                    cleaned_df[feature] = cleaned_df[feature].astype('float32')
+            return cleaned_df
+
+        train_df = clean_and_convert_features(train_df, self.tabular_features)
+        val_df = clean_and_convert_features(val_df, self.tabular_features)
+        test_df = clean_and_convert_features(test_df, self.tabular_features)
+
+        # --- Save Preprocessing Objects ---
+        try:
+            with open(os.path.join(self.preprocessor_dir, "scaler.pkl"), 'wb') as f:
+                pickle.dump(self.scaler, f)
+            with open(os.path.join(self.preprocessor_dir, "one_hot_encoder.pkl"), 'wb') as f:
+                pickle.dump(self.one_hot_encoder, f)
+            with open(os.path.join(self.preprocessor_dir, "label_encoder.pkl"), 'wb') as f:
+                pickle.dump(self.label_encoder, f)
+            # Also save tabular_features list for consistent column order in prediction
+            with open(os.path.join(self.preprocessor_dir, "tabular_features.pkl"), 'wb') as f:
+                pickle.dump(self.tabular_features, f)
+            print(f"Preprocessing objects saved to {self.preprocessor_dir}/")
+        except Exception as e:
+            print(f"Error saving preprocessing objects: {e}")
+
         # --- Create Image Paths ---
         for d in [train_df, val_df, test_df]:
-            d['img_path'] = d[self.image_col].apply(lambda x: os.path.join(self.image_base_dir, x))
+            d['img_path'] = d[self.image_col].apply(lambda x: os.path.join(self.image_base_dir, x) if pd.notna(x) else None)
 
         # --- Create Datasets and DataLoaders ---
         print("Creating Datasets and DataLoaders...")
-        train_dataset = HousingDataset(train_df, self.tabular_features, self.useMask, self.train_transforms)
-        val_dataset = HousingDataset(val_df, self.tabular_features, self.useMask, self.val_transforms) # Use val_transforms here
-        test_dataset = HousingDataset(test_df, self.tabular_features, self.useMask, self.val_transforms) # Use val_transforms here
+        train_dataset = HousingDataset(train_df, self.tabular_features, self.train_transforms, include_mask=self.useMask)
+        val_dataset = HousingDataset(val_df, self.tabular_features, self.val_transforms, include_mask=self.useMask)
+        test_dataset = HousingDataset(test_df, self.tabular_features, self.val_transforms, include_mask=self.useMask)
 
         num_workers = 0 if os.name == 'nt' else 2
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
@@ -223,19 +299,16 @@ class MultimodalPipeline:
         loop = tqdm(dataloader, desc=desc, leave=False)
 
         for batch_data in loop:
+            # Flexible unpacking based on whether mask is included
             if self.useMask:
-                images, tabular_data, masks, labels = batch_data
-                images, tabular_data, masks, labels = images.to(self.device), tabular_data.to(self.device), masks.to(self.device), labels.to(self.device)
+                images, masks, tabular_data, labels = batch_data
+                images, masks, tabular_data, labels = images.to(self.device), masks.to(self.device), tabular_data.to(self.device), labels.to(self.device)
             else:
                 images, tabular_data, labels = batch_data
                 images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
 
-
             with torch.set_grad_enabled(is_training):
-                if self.useMask:
-                    outputs = self.model(images, tabular_data, masks)
-                else:
-                    outputs = self.model(images, tabular_data)
+                outputs = self.model(images, masks if self.useMask else None, tabular_data)
 
                 loss = self.criterion(outputs, labels)
 
@@ -256,6 +329,101 @@ class MultimodalPipeline:
         return epoch_loss, epoch_acc, epoch_f1
 
 
+    def train(self, epochs = None):
+        """Runs the full training and validation loop."""
+
+        if epochs and epochs >= 1:
+            self.epochs = epochs
+
+        print("🚀 Starting full pipeline execution...")
+        print(f"Training for {self.epochs} epochs...")
+
+        for epoch in range(1, self.epochs + 1):
+            print(f"\n--- Epoch {epoch}/{self.epochs} ---")
+
+            train_loss, train_acc, train_f1 = self._run_epoch(self.train_loader, is_training=True)
+            val_loss, val_acc, val_f1 = self._run_epoch(self.val_loader, is_training=False)
+
+            print(f"Epoch {epoch} Summary:")
+            print(f"  Train -> Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
+            print(f"  Valid -> Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+
+            if val_f1 > self.best_val_f1:
+                self.best_val_f1 = val_f1
+                self.best_model_path = self._save_model()
+                print(f"🎉 New best model saved with F1 score: {self.best_val_f1:.4f}")
+
+        print("\n✅ Training complete.")
+
+    def evaluate(self, dataloader_type='test'):
+        """
+        Evaluates the model on the specified dataset (test or validation).
+        Loads the best saved model before evaluation.
+        """
+        if self.best_model_path:
+            print(f"\n📊 Loading best model from '{self.best_model_path}' and evaluating on the {dataloader_type} set...")
+            final_model = self.load_saved_model(self.best_model_path)
+        else:
+            print("\n⚠️ No best model saved during training. Evaluating current model state.")
+            final_model = self.model # Evaluate the current model if no best was saved
+
+        final_model.eval()
+        all_preds = []
+        all_labels = []
+        all_probs = []
+
+        dataloader = self.test_loader if dataloader_type == 'test' else self.val_loader
+
+        with torch.no_grad():
+            for batch_data in dataloader:
+                if self.useMask:
+                    images, masks, tabular_data, labels = batch_data
+                    images, masks, tabular_data, labels = images.to(self.device), masks.to(self.device), tabular_data.to(self.device), labels.to(self.device)
+                    outputs = final_model(images, masks, tabular_data)
+                else:
+                    images, tabular_data, labels = batch_data
+                    images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
+                    outputs = final_model(images, None, tabular_data)
+
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                all_probs.extend(probs)
+
+                preds = np.argmax(probs, axis=1)
+                all_preds.extend(preds)
+                all_labels.extend(labels.cpu().numpy())
+
+        # --- Calculate and Print Individual Metrics ---
+        print("\n--- Evaluation Metrics ---")
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        kappa = cohen_kappa_score(all_labels, all_preds)
+        logloss = log_loss(all_labels, all_probs)
+
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision (macro): {precision:.4f}")
+        print(f"Recall (macro): {recall:.4f}")
+        print(f"F1 Score (macro): {f1:.4f}")
+        print(f"Cohen's Kappa: {kappa:.4f}")
+        print(f"Log Loss: {logloss:.4f}")
+
+        # --- Classification Report ---
+        print("\n--- Classification Report ---")
+        print(classification_report(all_labels, all_preds, target_names=self.class_names, zero_division=0))
+
+        # --- Confusion Matrix ---
+        print("\n--- Confusion Matrix ---")
+        cm = confusion_matrix(all_labels, all_preds)
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt="d", cmap='Blues', xticklabels=self.class_names, yticklabels=self.class_names)
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title('Confusion Matrix')
+        plt.show()
+
+        print(f"\n✅ Pipeline finished successfully for {dataloader_type} evaluation!")
+
     def _save_model(self):
         """
         Saves the model's state dictionary. It will overwrite the existing 'best_model.pth'
@@ -272,7 +440,7 @@ class MultimodalPipeline:
         path_to_save = base_path
         if existing_pth_files:
             # If other .pth files exist, create a new timestamped file
-            timestamp = datetime.now().strftime("%m%d_%H%M")
+            timestamp = datetime.now().strftime("%m-%d_%H%M")
             base_name, ext = os.path.splitext(self.save_filename)
             path_to_save = os.path.join(models_dir, f"{base_name}_{timestamp}{ext}")
             print(f"Other models found in '{models_dir}'. Saving new model to '{path_to_save}' to avoid conflict.")
@@ -286,150 +454,234 @@ class MultimodalPipeline:
         return path_to_save
 
 
-    def load_saved_model(self, path):
+    def load_saved_model(self, path, evaluate = True):
         """Loads a saved model state dictionary."""
         # Re-initialize a fresh model architecture
-        loaded_model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes, useMask=self.useMask)
+        loaded_model = self.model_class(
+            tabular_input_dim=self.tabular_input_dim,
+            num_classes=self.num_classes
+        )
         loaded_model.load_state_dict(torch.load(path, map_location=self.device))
         loaded_model.to(self.device)
+        if evaluate:
+            loaded_model.eval()
+            print(f"Model loaded from {path} and set to evaluation mode.")
         return loaded_model
 
-    def _load_model(self, path):
-        """Loads a saved model state dictionary."""
-        # Re-initialize a fresh model architecture
-        loaded_model = self.model_class(tabular_input_dim=self.tabular_input_dim, num_classes=self.num_classes, useMask=self.useMask)
-        loaded_model.load_state_dict(torch.load(path, map_location=self.device))
-        loaded_model.to(self.device)
-        loaded_model.eval()
-        print(f"Model loaded from {path} and set to evaluation mode.")
-        return loaded_model
+    def _load_preprocessors(self):
+        """Loads saved preprocessor objects."""
+        # This method is crucial and should be present and correct.
+        try:
+            with open(os.path.join(self.preprocessor_dir, "scaler.pkl"), 'rb') as f:
+                self.scaler = pickle.load(f)
+            with open(os.path.join(self.preprocessor_dir, "one_hot_encoder.pkl"), 'rb') as f:
+                self.one_hot_encoder = pickle.load(f)
+            with open(os.path.join(self.preprocessor_dir, "label_encoder.pkl"), 'rb') as f:
+                self.label_encoder = pickle.load(f)
+                self.class_names = list(self.label_encoder.classes_)
+                self.num_classes = len(self.class_names)
+            with open(os.path.join(self.preprocessor_dir, "tabular_features.pkl"), 'rb') as f:
+                self.tabular_features = pickle.load(f)
+            self.tabular_input_dim = len(self.tabular_features)
+            print("Preprocessing objects loaded successfully.")
+        except FileNotFoundError:
+            raise FileNotFoundError("Preprocessor files not found. Please ensure the pipeline has been trained or preprocessors saved.")
+        except Exception as e:
+            print(f"Error loading preprocessors: {e}")
+            raise
 
 
-    def train(self):
-        """Runs the main training and validation loop."""
-        print("\n🚀 Starting Training Loop...")
-        print(f"Model has {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters.")
-        print(f"Training for {self.epochs} epochs.")
+    def classify(self, input_csv_name: str = 'input.csv', input_image_dir: str = 'images', thresh_hold = 0.5):
+        """
+        Classifies a single, unlabeled data entry from a CSV file and its corresponding image.
 
-        for epoch in range(1, self.epochs + 1):
-            print(f"\n--- Epoch {epoch}/{self.epochs} ---")
+        Args:
+            input_csv_name (str): The name of the CSV file containing the single data entry.
+                                  Assumed to be in './input/'.
+            input_image_dir (str): The directory within './input/' where the image is located.
 
-            train_loss, train_acc, train_f1 = self._run_epoch(self.train_loader, is_training=True)
-            val_loss, val_acc, val_f1 = self._run_epoch(self.val_loader, is_training=False)
+        Returns:
+            str: The predicted class label for the input data.
+        """
+        print("\n--- Starting Classification of New Data Entry ---")
+        
+        self.thresh_hold = thresh_hold
 
-            print(f"   Train -> Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
-            print(f"   Valid -> Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+        # Load preprocessors if not already loaded (e.g., if pipeline initialized without training)
+        if not hasattr(self, 'scaler') or self.scaler is None:
+            self._load_preprocessors()
 
-            # Save the best model based on validation F1 score
-            if val_f1 > self.best_val_f1:
-                self.best_val_f1 = val_f1
-                self.best_model_path = self._save_model()
-                print(f"🎉 New best model saved with F1 score: {self.best_val_f1:.4f}")
+        # Adjusted path for input CSV to match your provided snippet's logic
+        # Assumes script is run from a directory where 'input' is a sibling.
+        input_csv_path = os.path.join('..', 'input', input_csv_name)
 
-        print("\n✅ Training complete.")
-        return self.best_model_path
+        try:
+            # 1. Load the single data entry
+            df_single = pd.read_csv(input_csv_path)
+            if len(df_single) != 1:
+                raise ValueError("Input CSV must contain exactly one data entry for classification.")
+            row = df_single.iloc[0]
 
-    def evaluate(self):
-        """Evaluates the best model on the test set and prints a comprehensive report."""
-        if not self.best_model_path:
-            print("\n⚠️ No best model found from training. Evaluating the last state.")
-            # Ensure the model is saved if no best one was found during training
-            self.best_model_path = self._save_model() # This will save the last state if no better model was found
+            # 2. Image Preprocessing
+            img_filename = row[self.image_col]
+            # Adjusted path for input image to match your provided snippet's logic
+            img_path = os.path.join('..', 'input', input_image_dir, img_filename)
+            
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"Image not found at {img_path}")
 
-        print(f"\n📊 Loading best model from '{self.best_model_path}' and evaluating on the test set...")
-        final_model = self._load_model(self.best_model_path)
+            img = Image.open(img_path).convert('RGB')
+            img = self.val_transforms(img)
+            img = img.unsqueeze(0)  # Add batch dimension
 
-        final_model.eval()
-        all_preds, all_labels, all_probs_list = [], [], [] # Renamed all_probs to all_probs_list
-
-        with torch.no_grad():
-            for batch_data in self.test_loader:
-                if self.useMask:
-                    images, tabular_data, masks, labels = batch_data
-                    images, tabular_data, masks, labels = images.to(self.device), tabular_data.to(self.device), masks.to(self.device), labels.to(self.device)
-                    outputs = final_model(images, tabular_data, masks)
+            mask = None
+            if self.useMask:
+                if 'geometry_wkt' not in row:
+                    print("Warning: 'geometry_wkt' column not found in input CSV, but useMask is True. Skipping mask generation for this entry.")
+                    pass 
                 else:
-                    images, tabular_data, labels = batch_data
-                    images, tabular_data, labels = images.to(self.device), tabular_data.to(self.device), labels.to(self.device)
-                    outputs = final_model(images, tabular_data)
+                    try:
+                        wkt_string = str(row['geometry_wkt']).strip()
+                        geom_obj = loads(wkt_string)
+                        mask_data = self._rasterize_polygon(geom_obj)
+                        mask = torch.tensor(mask_data, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                    except WKTReadingError as e: # Use WKTReadingError directly
+                        print(f"Warning: Could not parse geometry_wkt for this entry ('{wkt_string}'). Error: {e}. Skipping mask generation.")
+                        mask = None
+                    except Exception as e:
+                        print(f"Warning: Unexpected error during mask generation for this entry: {e}. Skipping mask generation.")
+                        mask = None
 
-                probs = torch.softmax(outputs, dim=1).cpu().numpy()
-                all_probs_list.append(probs) # Append the numpy array for each batch
+            # 4. Tabular Data Preprocessing
+            df_single_processed = pd.DataFrame([row])
 
-                preds = np.argmax(probs, axis=1)
-                all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
+            actual_numeric_cols = [col for col in self.numeric_cols if col in df_single_processed.columns]
+            if actual_numeric_cols:
+                df_single_processed[actual_numeric_cols] = self.scaler.transform(df_single_processed[actual_numeric_cols])
+            
+            actual_categorical_cols = [col for col in self.categorical_cols if col in df_single_processed.columns]
+            if actual_categorical_cols:
+                for col in actual_categorical_cols:
+                    if col in self.one_hot_encoder.feature_names_in_:
+                        encoder_categories = self.one_hot_encoder.categories_[self.one_hot_encoder.feature_names_in_.tolist().index(col)]
+                        # Ensure the column is categorical with the correct categories before one-hot encoding
+                        df_single_processed[col] = pd.Categorical(df_single_processed[col], categories=encoder_categories)
+                    else:
+                        # If a category is completely unseen for a column, treat it as a new category
+                        # (OneHotEncoder with handle_unknown='ignore' will produce all zeros for it)
+                        df_single_processed[col] = df_single_processed[col].astype('category')
+                
+                encoded_data = self.one_hot_encoder.transform(df_single_processed[actual_categorical_cols])
+                cat_encoded_cols = list(self.one_hot_encoder.get_feature_names_out(actual_categorical_cols))
+                encoded_df = pd.DataFrame(encoded_data, columns=cat_encoded_cols, index=df_single_processed.index)
+                df_single_processed = pd.concat([df_single_processed.drop(columns=actual_categorical_cols, errors='ignore'), encoded_df], axis=1)
 
-        # Concatenate all probability arrays into a single 2D array
-        all_probs_combined = np.vstack(all_probs_list)
+            for feature in self.tabular_features:
+                if feature in df_single_processed.columns:
+                    df_single_processed[feature] = pd.to_numeric(df_single_processed[feature], errors='coerce')
+                    df_single_processed[feature] = df_single_processed[feature].fillna(0)
+                    df_single_processed[feature] = df_single_processed[feature].astype('float32')
+                else:
+                    df_single_processed[feature] = 0.0 # This handles unseen one-hot encoded columns
+            
+            tabular_data = torch.tensor(df_single_processed[self.tabular_features].values.astype(np.float32), dtype=torch.float32)
+            
+            self.model.eval()
 
-        # --- Calculate and Print Metrics ---
-        print("\n--- Evaluation Metrics ---")
-        accuracy = accuracy_score(all_labels, all_preds)
-        precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        kappa = cohen_kappa_score(all_labels, all_preds)
-        # Pass the correctly shaped all_probs_combined to log_loss
-        logloss = log_loss(all_labels, all_probs_combined)
+            with torch.no_grad():
+                img = img.to(self.device)
+                if mask is not None:
+                    mask = mask.to(self.device)
+                tabular_data = tabular_data.to(self.device)
+                
+                outputs = self.model(img, mask if self.useMask else None, tabular_data)
+                
+                probabilities = torch.softmax(outputs, dim=1)
+                predicted_label_idx = torch.argmax(probabilities, dim=1).item()
 
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"Precision (macro): {precision:.4f}")
-        print(f"Recall (macro): {recall:.4f}")
-        print(f"F1 Score (macro): {f1:.4f}")
-        print(f"Cohen's Kappa: {kappa:.4f}")
-        print(f"Log Loss: {logloss:.4f}")
+            certainty = probabilities.tolist()[0][predicted_label_idx]
+            if certainty < self.thresh_hold:
+                predicted_class_name = f'Uncertain'
+            else:
+                predicted_class_name = self.label_encoder.inverse_transform([predicted_label_idx])[0]
 
+            print(f"✅ Classification complete. Predicted class: {predicted_class_name}")
+            return predicted_class_name, probabilities.tolist()[0], predicted_label_idx
 
-        # --- Classification Report ---
-        print("\n--- Classification Report ---")
-        print(classification_report(all_labels, all_preds, target_names=self.class_names, zero_division=0))
+        except FileNotFoundError as e:
+            print(f"Error: {e}. Please ensure the 'input' folder, '{input_csv_name}' CSV, and the image are correctly placed.")
+            return None
+        except ValueError as e:
+            print(f"Error during data processing: {e}")
+            return None
+        except Exception as e:
+            print(f"An unexpected error occurred during classification: {e}")
+            return None
 
-        # --- Confusion Matrix ---
-        cm = confusion_matrix(all_labels, all_preds)
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt="d", cmap='Blues', xticklabels=self.class_names, yticklabels=self.class_names)
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
-        plt.title('Confusion Matrix')
-        plt.show()
-
-        print("\n✅ Pipeline finished successfully!")
 
 class HousingDataset(Dataset):
     """Custom PyTorch Dataset for loading images and tabular features."""
-    def __init__(self, df, tabular_features, useMask, transform=None):
+    def __init__(self, df, tabular_features, transform=None, include_mask=False):
         self.df = df.reset_index(drop=True)
         self.transform = transform
-        self.useMask = useMask
         self.tabular_features = tabular_features
+        self.include_mask = include_mask
+
+        self._remove_missing()
 
     def __len__(self):
         return len(self.df)
 
+    def _remove_missing(self):
+        initial_len = len(self.df)
+        # Check if 'img_path' column exists
+        if 'img_path' not in self.df.columns:
+            print("Warning: 'img_path' column not found in DataFrame. Cannot check for missing images.")
+            return
+
+        img_paths = self.df['img_path'].dropna().tolist() # Get non-NA paths
+        existing_paths = [path for path in img_paths if os.path.exists(path)]
+
+        # Filter the DataFrame to keep only rows with existing image paths
+        # This approach avoids iterating row by row with os.path.exists for performance
+        if len(existing_paths) < len(img_paths):
+            self.df = self.df[self.df['img_path'].isin(existing_paths)].reset_index(drop=True)
+            print(f"Dropped {initial_len - len(self.df)} rows due to missing image paths.")
+        # If the df initially had NaNs in 'img_path', those would have been dropped by dropna above.
+        # So we also need to account for rows that had img_path but it was None/NaN.
+        # The initial_len accounts for all rows including those with missing paths.
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        img_path = row.get('img_path', None)
+
         try:
-            # Image processing
-            img = Image.open(row['img_path']).convert('RGB')
+            img = Image.open(img_path).convert('RGB')
             if self.transform:
                 img = self.transform(img)
+            else:
+                # Default conversion if no transform specified, ensure it's a tensor
+                img = transforms.ToTensor()(img) # Basic ToTensor for consistency
 
-            # Tabular features
-            tab_feats_vals = row[self.tabular_features].values.astype(np.float32)
-            tab_feats = torch.from_numpy(tab_feats_vals)
-
-            # Label
+            tabular_data = torch.tensor(row[self.tabular_features].values.astype(np.float32), dtype=torch.float32)
             label = torch.tensor(row['label'], dtype=torch.long)
 
-            if self.useMask:
-                mask = torch.from_numpy(row['mask']).float().unsqueeze(0)
-                return img, tab_feats, mask, label
+            if self.include_mask:
+                # Ensure mask is a NumPy array before converting to tensor if not already
+                mask_data = row['mask']
+                if not isinstance(mask_data, np.ndarray):
+                    mask_data = np.array(mask_data)
+                # Reshape mask to [1, H, W] for single channel
+                mask = torch.tensor(mask_data, dtype=torch.float32).unsqueeze(0)
+                return img, mask, tabular_data, label
             else:
-                return img, tab_feats, label
-
-
+                # Return dummy mask if not included for consistent model forward signature
+                dummy_mask = torch.zeros(1, *self.transform.transforms[0].size, dtype=torch.float32) if self.transform else torch.zeros(1, 224, 224, dtype=torch.float32)
+                return img, dummy_mask, tabular_data, label # Always return a mask (dummy if not actual)
         except Exception as e:
-            # On error, return the next valid sample to avoid crashing the loader
-            # print(f"Error loading data at index {idx} (path: {row['img_path']}). Skipping. Error: {e}")
-            return self.__getitem__((idx + 1) % len(self))
+            print(f"Error loading data at index {idx} (path: {img_path}). Error: {e}")
+            # Instead of recursively calling, which can lead to infinite loops if many bad rows,
+            # we can skip this item or raise a more specific error, or return a default/empty.
+            # For robustness in DataLoader, dropping during _remove_missing is better.
+            # If still failing, it implies an unhandled issue.
+            raise RuntimeError(f"Critical error loading data at index {idx}. Check data integrity. Original error: {e}")
