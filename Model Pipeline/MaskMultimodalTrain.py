@@ -344,4 +344,4 @@ if __name__ == '__main__':
     )
 
     pipeline.train()
-    #pipeline.evaluate()
+    pipeline.evaluate()
