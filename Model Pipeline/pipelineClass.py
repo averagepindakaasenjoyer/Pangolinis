@@ -19,7 +19,6 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from shapely.wkt import loads
-from shapely.errors import WKTReadingError
 
 class MultimodalPipeline:
     """
@@ -115,6 +114,9 @@ class MultimodalPipeline:
         self.best_val_f1 = 0
         self.best_model_path = None
 
+        self.history = {'train_loss': [], 'train_acc': [], 'train_f1': [],
+            'val_loss': [], 'val_acc': [], 'val_f1': []}
+
 
     def _get_transforms(self):
         """Defines the image transformations for training and validation sets."""
@@ -172,7 +174,7 @@ class MultimodalPipeline:
              print("Mask usage is disabled for the pipeline.")
 
 
-        # 1. Stratified split into train (60%), validation (20%), and test (20%)
+        # 1. Stratified split into train (70%), validation (15%), and test (15%)
         print("Splitting data...")
         # Ensure target column exists before stratifying
         if self.target_col not in df.columns:
@@ -182,7 +184,7 @@ class MultimodalPipeline:
         df = df.dropna(subset=[self.target_col]).reset_index(drop=True)
 
 
-        train_df, temp_df = train_test_split(df, test_size=0.4, random_state=42, stratify=df[self.target_col])
+        train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42, stratify=df[self.target_col])
         val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df[self.target_col])
 
         # --- Preprocess Target Column ---
@@ -328,7 +330,6 @@ class MultimodalPipeline:
         epoch_f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
         return epoch_loss, epoch_acc, epoch_f1
 
-
     def train(self, epochs = None):
         """Runs the full training and validation loop."""
 
@@ -344,6 +345,13 @@ class MultimodalPipeline:
             train_loss, train_acc, train_f1 = self._run_epoch(self.train_loader, is_training=True)
             val_loss, val_acc, val_f1 = self._run_epoch(self.val_loader, is_training=False)
 
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['train_f1'].append(train_f1)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['val_f1'].append(val_f1)
+
             print(f"Epoch {epoch} Summary:")
             print(f"  Train -> Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
             print(f"  Valid -> Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
@@ -355,17 +363,16 @@ class MultimodalPipeline:
 
         print("\n✅ Training complete.")
 
-    def evaluate(self, dataloader_type='test'):
-        """
-        Evaluates the model on the specified dataset (test or validation).
-        Loads the best saved model before evaluation.
-        """
+    def evaluate(self, dataloader_type='test', 
+             show_confusion_matrix=True, 
+             show_training_curves=True, 
+             show_feature_importance=True):
         if self.best_model_path:
             print(f"\n📊 Loading best model from '{self.best_model_path}' and evaluating on the {dataloader_type} set...")
             final_model = self.load_saved_model(self.best_model_path)
         else:
             print("\n⚠️ No best model saved during training. Evaluating current model state.")
-            final_model = self.model # Evaluate the current model if no best was saved
+            final_model = self.model
 
         final_model.eval()
         all_preds = []
@@ -392,37 +399,170 @@ class MultimodalPipeline:
                 all_preds.extend(preds)
                 all_labels.extend(labels.cpu().numpy())
 
-        # --- Calculate and Print Individual Metrics ---
+        # --- Metrics ---
         print("\n--- Evaluation Metrics ---")
-        accuracy = accuracy_score(all_labels, all_preds)
-        precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
-        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        kappa = cohen_kappa_score(all_labels, all_preds)
-        logloss = log_loss(all_labels, all_probs)
+        print(f"Accuracy: {accuracy_score(all_labels, all_preds):.4f}")
+        print(f"Precision (macro): {precision_score(all_labels, all_preds, average='macro', zero_division=0):.4f}")
+        print(f"Recall (macro): {recall_score(all_labels, all_preds, average='macro', zero_division=0):.4f}")
+        print(f"F1 Score (macro): {f1_score(all_labels, all_preds, average='macro', zero_division=0):.4f}")
+        print(f"Cohen's Kappa: {cohen_kappa_score(all_labels, all_preds):.4f}")
+        print(f"Log Loss: {log_loss(all_labels, all_probs):.4f}")
 
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"Precision (macro): {precision:.4f}")
-        print(f"Recall (macro): {recall:.4f}")
-        print(f"F1 Score (macro): {f1:.4f}")
-        print(f"Cohen's Kappa: {kappa:.4f}")
-        print(f"Log Loss: {logloss:.4f}")
-
-        # --- Classification Report ---
         print("\n--- Classification Report ---")
         print(classification_report(all_labels, all_preds, target_names=self.class_names, zero_division=0))
 
         # --- Confusion Matrix ---
-        print("\n--- Confusion Matrix ---")
-        cm = confusion_matrix(all_labels, all_preds)
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt="d", cmap='Blues', xticklabels=self.class_names, yticklabels=self.class_names)
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
-        plt.title('Confusion Matrix')
-        plt.show()
+        if show_confusion_matrix:
+            print("\n--- Confusion Matrix ---")
+            cm = confusion_matrix(all_labels, all_preds)
+            plt.figure(figsize=(12, 10))
+            sns.heatmap(cm, annot=True, fmt="d", cmap='Blues',
+                        xticklabels=self.class_names, yticklabels=self.class_names)
+            plt.xlabel('Predicted Label')
+            plt.ylabel('True Label')
+            plt.title('Confusion Matrix')
+            plt.show()
+
+        # --- Training Curves ---
+        if show_training_curves:
+            epochs = np.arange(1, len(self.history['train_loss']) + 1)
+            plt.figure(figsize=(12, 5))
+
+            plt.subplot(1, 2, 1)
+            plt.plot(epochs, self.history['train_loss'], label='Train Loss')
+            plt.plot(epochs, self.history['val_loss'], label='Val Loss')
+            plt.title('Loss over Epochs')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.xticks(epochs)
+            plt.legend()
+
+            plt.subplot(1, 2, 2)
+            plt.plot(epochs, self.history['train_acc'], label='Train Accuracy')
+            plt.plot(epochs, self.history['val_acc'], label='Val Accuracy')
+            plt.plot(epochs, self.history['train_f1'], label='Train F1-Score')
+            plt.plot(epochs, self.history['val_f1'], label='Val F1-Score')
+            plt.title('Metrics over Epochs')
+            plt.xlabel('Epoch')
+            plt.ylabel('Score')
+            plt.xticks(epochs)
+            plt.legend()
+
+            plt.tight_layout()
+            plt.show()
+
+        if show_feature_importance:
+            def get_sample_batch(loader, batch_size=32):
+                for batch in loader:
+                    if self.useMask:
+                        return [x[:batch_size] for x in batch]
+                    else:
+                        return [x[:batch_size] for x in batch]
+
+            class ModelWrapper:
+                def __init__(self, model, device, model_type):
+                    self.model = model
+                    self.device = device
+                    self.model_type = model_type
+
+                def fit(self, X_tabular, y):
+                    self.X_tabular = torch.tensor(X_tabular, dtype=torch.float32).to(self.device)
+
+                def predict(self, X_tabular):
+                    self.model.eval()
+                    X_tabular = torch.tensor(X_tabular, dtype=torch.float32).to(self.device)
+                    dummy_images = torch.zeros(len(X_tabular), 3, 224, 224).to(self.device)
+                    dummy_masks = torch.zeros(len(X_tabular), 1, 224, 224).to(self.device)
+                    with torch.no_grad():
+                        if self.model_type == 'MultiMask':
+                            outputs = self.model(dummy_images, dummy_masks, X_tabular)
+                        else:
+                            outputs = self.model(dummy_images, X_tabular)
+                        preds = torch.argmax(outputs, dim=1)
+                    return preds.cpu().numpy()
+
+            print("\n🔍 Analyzing tabular feature importance...")
+            sample_batch = get_sample_batch(self.test_loader, batch_size=min(100, 32))
+
+            if self.useMask:
+                sample_images, sample_masks, sample_tabular, sample_labels = sample_batch
+                X_combined = (sample_images.numpy(), sample_masks.numpy(), sample_tabular.numpy())
+            else:
+                sample_images, sample_tabular, sample_labels = sample_batch
+                X_combined = (sample_images.numpy(), sample_tabular.numpy())
+
+            y_true = sample_labels.numpy()
+
+            model_wrapper = ModelWrapper(final_model, self.device, 'MultiMask' if self.useMask else 'SimpleModel')
+            model_wrapper.fit(X_combined[2] if self.useMask else X_combined[1], y_true)
+
+            final_model.eval()
+            final_model.zero_grad()
+
+            criterion = nn.CrossEntropyLoss()
+
+            if self.useMask:
+                images = sample_images.to(self.device).requires_grad_(True)
+                masks = sample_masks.to(self.device)
+                tabular = sample_tabular.to(self.device).requires_grad_(True)
+                outputs = final_model(images, masks, tabular)
+            else:
+                images = sample_images.to(self.device)
+                tabular = sample_tabular.to(self.device).requires_grad_(True)
+                outputs = final_model(images, None, tabular)
+
+            preds = torch.argmax(outputs, dim=1)
+            loss = criterion(outputs, preds)
+            loss.backward()
+
+            if tabular.grad is not None:
+                grad_importance = torch.abs(tabular.grad).mean(dim=0).cpu().numpy()
+            else:
+                grad_importance = np.zeros(len(self.tabular_features))
+
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+            feature_names = [f.replace('_', ' ').title() for f in self.tabular_features]
+
+            ax1.barh(range(len(grad_importance)), grad_importance)
+            ax1.set_yticks(range(len(feature_names)))
+            ax1.set_yticklabels(feature_names, fontsize=8)
+            ax1.set_xlabel('Gradient Magnitude')
+            ax1.set_title('Gradient-based Feature Importance')
+            ax1.grid(alpha=0.3)
+
+            top_indices = np.argsort(grad_importance)[-10:]
+            ax2.barh(range(len(top_indices)), grad_importance[top_indices])
+            ax2.set_yticks(range(len(top_indices)))
+            ax2.set_yticklabels([feature_names[i] for i in top_indices], fontsize=10)
+            ax2.set_xlabel('Gradient Magnitude')
+            ax2.set_title('Top 10 Most Important Features')
+            ax2.grid(alpha=0.3)
+
+            ax3.hist(grad_importance, bins=20, alpha=0.7, edgecolor='black')
+            ax3.set_xlabel('Gradient Magnitude')
+            ax3.set_ylabel('Number of Features')
+            ax3.set_title('Distribution of Feature Importance')
+            ax3.grid(alpha=0.3)
+
+            top_15_indices = np.argsort(grad_importance)[-15:]
+            normalized_importance = grad_importance[top_15_indices] / np.sum(grad_importance[top_15_indices])
+
+            ax4.pie(normalized_importance, labels=[feature_names[i][:15] + '...' if len(feature_names[i]) > 15 else feature_names[i] for i in top_15_indices],
+                    autopct='%1.1f%%', startangle=90)
+            ax4.set_title('Top Features - Relative Importance')
+
+            plt.tight_layout()
+            plt.show()
+
+            print("\n📈 Top Most Important Features:")
+            for i, idx in enumerate(top_indices[-10:][::-1]):
+                print(f"  {i+1:2d}. {feature_names[idx]}: {grad_importance[idx]:.6f}")
+
 
         print(f"\n✅ Pipeline finished successfully for {dataloader_type} evaluation!")
+
+
+
 
     def _save_model(self):
         """
@@ -491,132 +631,117 @@ class MultimodalPipeline:
             raise
 
 
-    def classify(self, input_csv_name: str = 'input.csv', input_image_dir: str = 'images', thresh_hold = 0.5):
+    def classify(self, input_csv_name: str = 'input.csv', input_image_dir: str = 'images', thresh_hold=0.5):
         """
-        Classifies a single, unlabeled data entry from a CSV file and its corresponding image.
+        Classifies one or more unlabeled data entries from a CSV file and their corresponding images.
 
         Args:
-            input_csv_name (str): The name of the CSV file containing the single data entry.
-                                  Assumed to be in './input/'.
-            input_image_dir (str): The directory within './input/' where the image is located.
+            input_csv_name (str): The name of the CSV file containing data entries (in './input/').
+            input_image_dir (str): Directory within './input/' where the images are located.
+            thresh_hold (float): Certainty threshold below which the result is labeled 'Uncertain'.
 
         Returns:
-            str: The predicted class label for the input data.
+            List[Tuple[str, List[float], int]]: A list of predictions, each being a tuple of:
+                                                (predicted class name, probability list, predicted label index).
         """
-        print("\n--- Starting Classification of New Data Entry ---")
-        
+        print("\n--- Starting Classification of Data Entries ---")
         self.thresh_hold = thresh_hold
 
-        # Load preprocessors if not already loaded (e.g., if pipeline initialized without training)
         if not hasattr(self, 'scaler') or self.scaler is None:
             self._load_preprocessors()
 
-        # Adjusted path for input CSV to match your provided snippet's logic
-        # Assumes script is run from a directory where 'input' is a sibling.
         input_csv_path = os.path.join('..', 'input', input_csv_name)
+        predictions = []
 
         try:
-            # 1. Load the single data entry
-            df_single = pd.read_csv(input_csv_path)
-            if len(df_single) != 1:
-                raise ValueError("Input CSV must contain exactly one data entry for classification.")
-            row = df_single.iloc[0]
+            df = pd.read_csv(input_csv_path)
 
-            # 2. Image Preprocessing
-            img_filename = row[self.image_col]
-            # Adjusted path for input image to match your provided snippet's logic
-            img_path = os.path.join('..', 'input', input_image_dir, img_filename)
-            
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"Image not found at {img_path}")
+            for _, row in df.iterrows():
+                try:
+                    img_filename = row[self.image_col]
+                    img_path = os.path.join('..', 'input', input_image_dir, img_filename)
 
-            img = Image.open(img_path).convert('RGB')
-            img = self.val_transforms(img)
-            img = img.unsqueeze(0)  # Add batch dimension
+                    if not os.path.exists(img_path):
+                        raise FileNotFoundError(f"Image not found at {img_path}")
 
-            mask = None
-            if self.useMask:
-                if 'geometry_wkt' not in row:
-                    print("Warning: 'geometry_wkt' column not found in input CSV, but useMask is True. Skipping mask generation for this entry.")
-                    pass 
-                else:
-                    try:
-                        wkt_string = str(row['geometry_wkt']).strip()
-                        geom_obj = loads(wkt_string)
-                        mask_data = self._rasterize_polygon(geom_obj)
-                        mask = torch.tensor(mask_data, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-                    except WKTReadingError as e: # Use WKTReadingError directly
-                        print(f"Warning: Could not parse geometry_wkt for this entry ('{wkt_string}'). Error: {e}. Skipping mask generation.")
-                        mask = None
-                    except Exception as e:
-                        print(f"Warning: Unexpected error during mask generation for this entry: {e}. Skipping mask generation.")
-                        mask = None
+                    img = Image.open(img_path).convert('RGB')
+                    img = self.val_transforms(img)
+                    img = img.unsqueeze(0)
 
-            # 4. Tabular Data Preprocessing
-            df_single_processed = pd.DataFrame([row])
+                    mask = None
+                    if self.useMask:
+                        if 'geometry_wkt' in row and pd.notna(row['geometry_wkt']):
+                            try:
+                                geom_obj = loads(str(row['geometry_wkt']).strip())
+                                mask_data = self._rasterize_polygon(geom_obj)
+                                mask = torch.tensor(mask_data, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+                            except Exception as e:
+                                print(f"Warning: Mask generation failed for entry with image {img_filename}: {e}")
+                                mask = None
+                        else:
+                            print(f"Warning: 'geometry_wkt' missing for entry with image {img_filename}. Skipping mask.")
 
-            actual_numeric_cols = [col for col in self.numeric_cols if col in df_single_processed.columns]
-            if actual_numeric_cols:
-                df_single_processed[actual_numeric_cols] = self.scaler.transform(df_single_processed[actual_numeric_cols])
-            
-            actual_categorical_cols = [col for col in self.categorical_cols if col in df_single_processed.columns]
-            if actual_categorical_cols:
-                for col in actual_categorical_cols:
-                    if col in self.one_hot_encoder.feature_names_in_:
-                        encoder_categories = self.one_hot_encoder.categories_[self.one_hot_encoder.feature_names_in_.tolist().index(col)]
-                        # Ensure the column is categorical with the correct categories before one-hot encoding
-                        df_single_processed[col] = pd.Categorical(df_single_processed[col], categories=encoder_categories)
+                    row_df = pd.DataFrame([row])
+
+                    actual_numeric_cols = [col for col in self.numeric_cols if col in row_df.columns]
+                    if actual_numeric_cols:
+                        row_df[actual_numeric_cols] = self.scaler.transform(row_df[actual_numeric_cols])
+
+                    actual_categorical_cols = [col for col in self.categorical_cols if col in row_df.columns]
+                    if actual_categorical_cols:
+                        for col in actual_categorical_cols:
+                            if col in self.one_hot_encoder.feature_names_in_:
+                                encoder_categories = self.one_hot_encoder.categories_[self.one_hot_encoder.feature_names_in_.tolist().index(col)]
+                                row_df[col] = pd.Categorical(row_df[col], categories=encoder_categories)
+                            else:
+                                row_df[col] = row_df[col].astype('category')
+
+                        encoded = self.one_hot_encoder.transform(row_df[actual_categorical_cols])
+                        encoded_cols = list(self.one_hot_encoder.get_feature_names_out(actual_categorical_cols))
+                        encoded_df = pd.DataFrame(encoded, columns=encoded_cols, index=row_df.index)
+                        row_df = pd.concat([row_df.drop(columns=actual_categorical_cols, errors='ignore'), encoded_df], axis=1)
+
+                    for feature in self.tabular_features:
+                        if feature in row_df.columns:
+                            row_df[feature] = pd.to_numeric(row_df[feature], errors='coerce').fillna(0).astype('float32')
+                        else:
+                            row_df[feature] = 0.0
+
+                    tabular_data = torch.tensor(row_df[self.tabular_features].values.astype(np.float32), dtype=torch.float32)
+
+                    self.model.eval()
+                    with torch.no_grad():
+                        img = img.to(self.device)
+                        if mask is not None:
+                            mask = mask.to(self.device)
+                        tabular_data = tabular_data.to(self.device)
+
+                        outputs = self.model(img, mask if self.useMask else None, tabular_data)
+                        probabilities = torch.softmax(outputs, dim=1)
+                        predicted_label_idx = torch.argmax(probabilities, dim=1).item()
+
+                    certainty = probabilities.tolist()[0][predicted_label_idx]
+                    if certainty < self.thresh_hold:
+                        predicted_class_name = 'Uncertain'
                     else:
-                        # If a category is completely unseen for a column, treat it as a new category
-                        # (OneHotEncoder with handle_unknown='ignore' will produce all zeros for it)
-                        df_single_processed[col] = df_single_processed[col].astype('category')
-                
-                encoded_data = self.one_hot_encoder.transform(df_single_processed[actual_categorical_cols])
-                cat_encoded_cols = list(self.one_hot_encoder.get_feature_names_out(actual_categorical_cols))
-                encoded_df = pd.DataFrame(encoded_data, columns=cat_encoded_cols, index=df_single_processed.index)
-                df_single_processed = pd.concat([df_single_processed.drop(columns=actual_categorical_cols, errors='ignore'), encoded_df], axis=1)
+                        predicted_class_name = self.label_encoder.inverse_transform([predicted_label_idx])[0]
 
-            for feature in self.tabular_features:
-                if feature in df_single_processed.columns:
-                    df_single_processed[feature] = pd.to_numeric(df_single_processed[feature], errors='coerce')
-                    df_single_processed[feature] = df_single_processed[feature].fillna(0)
-                    df_single_processed[feature] = df_single_processed[feature].astype('float32')
-                else:
-                    df_single_processed[feature] = 0.0 # This handles unseen one-hot encoded columns
-            
-            tabular_data = torch.tensor(df_single_processed[self.tabular_features].values.astype(np.float32), dtype=torch.float32)
-            
-            self.model.eval()
+                    print(f"✅ Entry with image '{img_filename}' predicted as: {predicted_class_name}")
+                    predictions.append((predicted_class_name, probabilities.tolist()[0], predicted_label_idx))
 
-            with torch.no_grad():
-                img = img.to(self.device)
-                if mask is not None:
-                    mask = mask.to(self.device)
-                tabular_data = tabular_data.to(self.device)
-                
-                outputs = self.model(img, mask if self.useMask else None, tabular_data)
-                
-                probabilities = torch.softmax(outputs, dim=1)
-                predicted_label_idx = torch.argmax(probabilities, dim=1).item()
+                except Exception as entry_error:
+                    print(f"Error processing row: {entry_error}")
+                    predictions.append(("Error", [], -1))
 
-            certainty = probabilities.tolist()[0][predicted_label_idx]
-            if certainty < self.thresh_hold:
-                predicted_class_name = f'Uncertain'
-            else:
-                predicted_class_name = self.label_encoder.inverse_transform([predicted_label_idx])[0]
-
-            print(f"✅ Classification complete. Predicted class: {predicted_class_name}")
-            return predicted_class_name, probabilities.tolist()[0], predicted_label_idx
+            return predictions
 
         except FileNotFoundError as e:
-            print(f"Error: {e}. Please ensure the 'input' folder, '{input_csv_name}' CSV, and the image are correctly placed.")
-            return None
-        except ValueError as e:
-            print(f"Error during data processing: {e}")
-            return None
+            print(f"Error: {e}. Please ensure the 'input' folder and input files are correctly placed.")
+            return []
         except Exception as e:
-            print(f"An unexpected error occurred during classification: {e}")
-            return None
+            print(f"Unexpected error during classification: {e}")
+            return []
+
 
 
 class HousingDataset(Dataset):
