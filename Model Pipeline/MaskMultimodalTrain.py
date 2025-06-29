@@ -73,12 +73,13 @@ class ImageModel(nn.Module):
         super(ImageModel, self).__init__()
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         resnet = models.resnet18(weights=weights)
+        # drop the final fc layer and avgpool
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.cnn_output_dim = cnn_output_dim
 
     def forward(self, x_img):
         # x_img: [B,3,H,W]
-        feat = self.backbone(x_img)
+        feat = self.backbone(x_img)               # [B, cnn_output_dim, 1, 1]
         return feat.view(feat.size(0), self.cnn_output_dim)
 
 class ResNet50Classifier(nn.Module):
@@ -86,9 +87,11 @@ class ResNet50Classifier(nn.Module):
         super().__init__()
         self.base_model = models.resnet50(pretrained=True)
 
+        # Freeze base model
         for param in self.base_model.parameters():
             param.requires_grad = False
 
+        # Replace the final fully connected layer
         in_features = self.base_model.fc.in_features
         self.base_model.fc = nn.Identity()
 
@@ -109,9 +112,11 @@ class ResNet50FeatureExtractor(nn.Module):
         super().__init__()
         self.base_model = models.resnet50(pretrained=pretrained)
 
+        # Remove the final fully connected layer
         self.base_model.fc = nn.Identity()
-        self.output_dim = 2048
+        self.output_dim = 2048  # This is the output dimension of resnet50 without the fc layer
 
+        # Optionally freeze weights
         for param in self.base_model.parameters():
             param.requires_grad = False
 
@@ -152,24 +157,25 @@ class EarlyFusionModel(nn.Module):
             nn.Linear(256, num_classes)
         )
 
-    def forward(self, image, tabular_data):
+    def forward(self, image, mask=None, tabular_data=None):
         img_feat = self.img_model(image)
         tab_feat = self.tab_model(tabular_data)
         fused = torch.cat([img_feat, tab_feat], dim=1)
         return self.classifier(fused)
 
 class EarlyFusionRFC(nn.Module):
-       def __init__(self, img_model, rfc_tabular, fusion_dim, num_classes):
+       def __init__(self, tabular_input_dim, num_classes, cnn_output_dim=512, pretrained=True, **kwargs):
            super().__init__()
-           self.img_model = img_model
-           self.rfc_tabular = rfc_tabular
+           self.img_model = ImageModel(cnn_output_dim=cnn_output_dim, pretrained=pretrained)
+           self.rfc_tabular = RandomForestTabular(input_dim=tabular_input_dim, num_classes=num_classes, **kwargs)
+           fusion_dim = cnn_output_dim + num_classes
            self.classifier = nn.Sequential(
                nn.Linear(fusion_dim, 256),
                nn.ReLU(),
                nn.Linear(256, num_classes)
            )
 
-       def forward(self, image, tabular_data):
+       def forward(self, image, mask=None, tabular_data=None):
            img_feat = self.img_model(image)
            tab_feats_np = tabular_data.detach().cpu().numpy()
            tab_logits = torch.tensor(self.rfc_tabular.predict_proba(tab_feats_np), dtype=torch.float32, device=image.device)
@@ -198,6 +204,7 @@ class LateFusionModel(nn.Module):
                  pretrained=True,
                  fusion_method='concat'):
         super(LateFusionModel, self).__init__()
+        # image branch
         self.img_model = ImageModel(cnn_output_dim=cnn_output_dim, pretrained=pretrained)
         self.img_clf = nn.Sequential(
             nn.Linear(cnn_output_dim, 256),
@@ -206,6 +213,7 @@ class LateFusionModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(256, num_classes)
         )
+        # tabular branch
         self.tab_model = TabularModel(input_dim=tabular_input_dim,
                                       emb_dim=tabular_emb_dim,
                                       hidden_dim=256,
@@ -221,7 +229,7 @@ class LateFusionModel(nn.Module):
         else:
             raise ValueError("fusion_method must be 'concat' or 'weighted'")
 
-    def forward(self, image, tabular_data):
+    def forward(self, image, mask=None, tabular_data=None):
         img_feat = self.img_model(image)
         img_logits = self.img_clf(img_feat)
 
@@ -236,6 +244,7 @@ class LateFusionModel(nn.Module):
             w_tab = torch.sigmoid(self.tab_w)
             return w_img * img_logits + w_tab * tab_logits
         
+
 class MaskImageModel(nn.Module):
     """
     ResNet18 backbone that optionally takes a mask, multiplies it with the image,
@@ -258,7 +267,7 @@ class MaskImageModel(nn.Module):
         feat = self.backbone(x_img)
         return feat.view(feat.size(0), self.cnn_output_dim)
 
-class MaskMultimodal(nn.Module): # Final multimodal model
+class MaskMultimodal(nn.Module):
     """
     Multimodal model incorporating image, mask, and tabular data.
     Image features are extracted with an optional mask application,
@@ -270,8 +279,7 @@ class MaskMultimodal(nn.Module): # Final multimodal model
                  cnn_output_dim=512,
                  tabular_emb_dim=128,
                  dropout=0.5,
-                 pretrained=True,
-                 useMask=False):
+                 pretrained=True):
         super(MaskMultimodal, self).__init__()
 
         self.frontview_image_model = ImageModel(cnn_output_dim=cnn_output_dim, pretrained=pretrained)
@@ -300,6 +308,69 @@ class MaskMultimodal(nn.Module): # Final multimodal model
         return self.classifier(fused)
     
 
+class PretrainedBackboneWrapper(nn.Module):
+    def __init__(self, pretrained_weights_path=None, freeze=True):
+        super().__init__()
+        self.base_model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.base_model.fc = nn.Identity()
+
+        if pretrained_weights_path:
+            print(f"Loading pretrained weights from: {pretrained_weights_path}")
+            state_dict = torch.load(pretrained_weights_path, map_location='cpu')
+            self.base_model.load_state_dict(state_dict, strict=False)
+
+        if freeze:
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+
+        self.output_dim = 2048
+
+    def forward(self, x):
+        return self.base_model(x)
+
+class MaskMultimodalWithPretrained(nn.Module):
+    def __init__(self, tabular_input_dim, num_classes, 
+                 tabular_emb_dim=128, dropout=0.5,
+                 pretrained_backbone_path=None):
+        super().__init__()
+
+        self.frontview_image_model = PretrainedBackboneWrapper(
+            pretrained_weights_path=pretrained_backbone_path,
+            freeze=True
+        )
+        self.masked_image_model = PretrainedBackboneWrapper(
+            pretrained_weights_path=pretrained_backbone_path,
+            freeze=True
+        )
+
+        self.tabular_model = nn.Sequential(
+            nn.Linear(tabular_input_dim, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(dropout),
+            nn.Linear(256, tabular_emb_dim),
+            nn.ReLU()
+        )
+
+        fusion_dim = 2048 + 2048 + tabular_emb_dim
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, image, mask, tabular_data):
+        masked_image = image * mask
+        frontview_features = self.frontview_image_model(image)
+        masked_features = self.masked_image_model(masked_image)
+        tabular_features = self.tabular_model(tabular_data)
+        fused = torch.cat([frontview_features, masked_features, tabular_features], dim=1)
+        return self.classifier(fused)
+    
+
 if __name__ == '__main__':
     load_dotenv()
     BASE_DIR = os.getenv('FILE_PATH')
@@ -310,18 +381,18 @@ if __name__ == '__main__':
     print(f"Base Directory: {BASE_DIR}")
     print(f"Data CSV Path: {DATA_PATH}")
 
-    NUMERIC_COLS = ['opp_pand', 'build_year']
-    CATEGORICAL_COLS = ['build_type']
+    numeric_cols = [ "procent_ingenomen", "area", "perimeter", "elongation",  "compactness", "huisnr_bag_letter"]
+    categorical_cols = ['build_type']
 
     pipeline = MultimodalPipeline(
-        model_class=MaskMultimodal,
+        model_class=MaskMultimodalWithPretrained,
         csv_path=DATA_PATH,
         image_base_dir=BASE_DIR,
         image_col='frontview_url',
         target_col='woningtype',
-        numeric_cols=NUMERIC_COLS,
-        categorical_cols=CATEGORICAL_COLS,
-        epochs=1, # You can specify the epochs here
+        numeric_cols=numeric_cols,
+        categorical_cols=categorical_cols,
+        epochs=20, # You can specify the epochs here
         lr=1e-4,
         batch_size=32,
         useMask=True
