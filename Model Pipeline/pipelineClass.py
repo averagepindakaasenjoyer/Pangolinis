@@ -631,21 +631,21 @@ class MultimodalPipeline:
             raise
 
 
-    def classify(self, input_csv_name: str = 'input.csv', input_image_dir: str = 'images', thresh_hold=0.5):
+    def classify(self, input_csv_name: str = 'input.csv', input_image_dir: str = 'images', threshold=0.5):
         """
         Classifies one or more unlabeled data entries from a CSV file and their corresponding images.
 
         Args:
             input_csv_name (str): The name of the CSV file containing data entries (in './input/').
             input_image_dir (str): Directory within './input/' where the images are located.
-            thresh_hold (float): Certainty threshold below which the result is labeled 'Uncertain'.
+            threshold (float): Certainty threshold below which the result is labeled 'Uncertain'.
 
         Returns:
             List[Tuple[str, List[float], int]]: A list of predictions, each being a tuple of:
                                                 (predicted class name, probability list, predicted label index).
         """
         print("\n--- Starting Classification of Data Entries ---")
-        self.thresh_hold = thresh_hold
+        self.threshold = threshold
 
         if not hasattr(self, 'scaler') or self.scaler is None:
             self._load_preprocessors()
@@ -721,7 +721,7 @@ class MultimodalPipeline:
                         predicted_label_idx = torch.argmax(probabilities, dim=1).item()
 
                     certainty = probabilities.tolist()[0][predicted_label_idx]
-                    if certainty < self.thresh_hold:
+                    if certainty < self.threshold:
                         predicted_class_name = 'Uncertain'
                     else:
                         predicted_class_name = self.label_encoder.inverse_transform([predicted_label_idx])[0]
