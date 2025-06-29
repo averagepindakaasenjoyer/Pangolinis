@@ -74,7 +74,7 @@ After making sure the data can be loaded in, execute the `Preprocessing.ipynb`. 
 
 To start using a model, you have two options.
 
-###### 1. Train your own model
+##### 1. Train your own model
 
 To train your own model, you will need to create a `class` that satisfies the following requirements:
 
@@ -97,7 +97,7 @@ To train your own model, you will need to create a `class` that satisfies the fo
 
 For an example of training have a look at `MaskMultimodalTrain.py`, where an example model has been defined and can be trained.
 
-###### 2. Load a saved model
+##### 2. Load a saved model
 
 The second option is to load a model. Take a look at `classify.ipynb` for an example of loading and classifying.
 
@@ -108,6 +108,7 @@ To load a model use the `YourMultimodelClass.load_saved_model('models/your_model
 Here is an overview of the available functions once a model and `MultimodelModelClass` have been created:
 
 - `train(epochs(optional))`
+  - Runs the full training and validation loop for the multimodal model. It tracks training and validation metrics (loss, accuracy, F1-score) and saves the best performing model based on validation F1-score.
   - Runs the full training and validation loop for the multimodal model. It tracks training and validation metrics (loss, accuracy, F1-score) and saves the best performing model based on validation F1-score.
   - **Parameters**: - `epochs (int, optional)`: The number of training epochs to run. If provided, it will override the epochs value set during pipeline initialization. If None, the initialized epochs value will be used.
     <br>
