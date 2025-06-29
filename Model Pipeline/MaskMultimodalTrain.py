@@ -8,6 +8,8 @@ from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 
 
+# Model definition
+
 class TabularModel(nn.Module):
     """
     MLP for tabular features matching `tabular_emb_dim`.
@@ -71,13 +73,12 @@ class ImageModel(nn.Module):
         super(ImageModel, self).__init__()
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         resnet = models.resnet18(weights=weights)
-        # drop the final fc layer and avgpool
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.cnn_output_dim = cnn_output_dim
 
     def forward(self, x_img):
         # x_img: [B,3,H,W]
-        feat = self.backbone(x_img)               # [B, cnn_output_dim, 1, 1]
+        feat = self.backbone(x_img)
         return feat.view(feat.size(0), self.cnn_output_dim)
 
 class ResNet50Classifier(nn.Module):
@@ -85,11 +86,9 @@ class ResNet50Classifier(nn.Module):
         super().__init__()
         self.base_model = models.resnet50(pretrained=True)
 
-        # Freeze base model
         for param in self.base_model.parameters():
             param.requires_grad = False
 
-        # Replace the final fully connected layer
         in_features = self.base_model.fc.in_features
         self.base_model.fc = nn.Identity()
 
@@ -110,11 +109,9 @@ class ResNet50FeatureExtractor(nn.Module):
         super().__init__()
         self.base_model = models.resnet50(pretrained=pretrained)
 
-        # Remove the final fully connected layer
         self.base_model.fc = nn.Identity()
-        self.output_dim = 2048  # This is the output dimension of resnet50 without the fc layer
+        self.output_dim = 2048
 
-        # Optionally freeze weights
         for param in self.base_model.parameters():
             param.requires_grad = False
 
@@ -195,13 +192,12 @@ class LateFusionModel(nn.Module):
     def __init__(self,
                  tabular_input_dim,
                  num_classes,
-                 cnn_output_dim=512,  # <-- changed from 512 to 2048 for ResNet50
+                 cnn_output_dim=512,
                  tabular_emb_dim=128,
                  dropout=0.5,
                  pretrained=True,
                  fusion_method='concat'):
         super(LateFusionModel, self).__init__()
-        # image branch
         self.img_model = ImageModel(cnn_output_dim=cnn_output_dim, pretrained=pretrained)
         self.img_clf = nn.Sequential(
             nn.Linear(cnn_output_dim, 256),
@@ -210,7 +206,6 @@ class LateFusionModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(256, num_classes)
         )
-        # tabular branch
         self.tab_model = TabularModel(input_dim=tabular_input_dim,
                                       emb_dim=tabular_emb_dim,
                                       hidden_dim=256,
@@ -251,29 +246,19 @@ class MaskImageModel(nn.Module):
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         resnet = models.resnet18(weights=weights)
         
-        # Modify the first conv layer if you want to concatenate mask as a channel
-        # For simplicity, here we assume mask is applied to RGB before passing to ResNet
-        # Or, if you want to process mask separately and combine features:
-        
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
         
-        # If you want to accept a 4-channel input (RGB + Mask)
-        # self.backbone[0] = nn.Conv2d(4, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-
         self.cnn_output_dim = cnn_output_dim
 
     def forward(self, x_img, x_mask=None):
-        # x_img: [B,3,H,W], x_mask: [B,1,H,W]
         
-        # Option 1: Apply mask directly to the image (element-wise multiplication)
         if x_mask is not None:
-            # Ensure mask is broadcastable to image channels
-            x_img = x_img * x_mask # Mask should be 0-1, so it gates the image
+            x_img = x_img * x_mask
         
-        feat = self.backbone(x_img) # [B, cnn_output_dim, 1, 1]
+        feat = self.backbone(x_img)
         return feat.view(feat.size(0), self.cnn_output_dim)
 
-class MaskMultimodal(nn.Module):
+class MaskMultimodal(nn.Module): # Final multimodal model
     """
     Multimodal model incorporating image, mask, and tabular data.
     Image features are extracted with an optional mask application,
@@ -282,7 +267,7 @@ class MaskMultimodal(nn.Module):
     def __init__(self,
                  tabular_input_dim,
                  num_classes,
-                 cnn_output_dim=512, # From MaskImageModel (e.g., ResNet18)
+                 cnn_output_dim=512,
                  tabular_emb_dim=128,
                  dropout=0.5,
                  pretrained=True,
@@ -296,7 +281,6 @@ class MaskMultimodal(nn.Module):
                                           hidden_dim=256,
                                           dropout=dropout)
         
-        # fusion_dim includes both image features, plus tabular features
         fusion_dim = cnn_output_dim + cnn_output_dim + tabular_emb_dim
         
         self.classifier = nn.Sequential(
@@ -337,11 +321,11 @@ if __name__ == '__main__':
         target_col='woningtype',
         numeric_cols=NUMERIC_COLS,
         categorical_cols=CATEGORICAL_COLS,
-        epochs=1, 
+        epochs=1, # You can specify the epochs here
         lr=1e-4,
         batch_size=32,
         useMask=True
     )
 
-    pipeline.train()
+    pipeline.train() # or specify them here with 'epochs=X'
     pipeline.evaluate()
